@@ -98,20 +98,49 @@ export async function fetchRealTurbineData(
   try {
     onProgress?.(`Fetching real wind turbine data for ${region.name}...`);
     
-    // Use a CORS proxy for development if needed
-    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
-    
-    const response = await fetch(proxyUrl);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    // Try multiple CORS proxies in case one fails
+    const corsProxies = [
+      (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+      (u: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    ];
+
+    let csvText = '';
+    let lastError: Error | null = null;
+
+    for (const proxyFn of corsProxies) {
+      try {
+        const proxyUrl = proxyFn(url);
+        onProgress?.(`Trying to fetch data...`);
+        
+        const response = await fetch(proxyUrl);
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        csvText = await response.text();
+        if (csvText && csvText.length > 100) {
+          break; // Success!
+        }
+      } catch (e) {
+        lastError = e as Error;
+        console.warn('CORS proxy failed:', e);
+      }
+    }
+
+    if (!csvText || csvText.length < 100) {
+      throw lastError || new Error('Failed to fetch data from all proxies');
     }
 
     onProgress?.('Parsing CSV data...');
-    const csvText = await response.text();
-    
     const turbines = parseOPSDData(csvText);
-    onProgress?.(`Loaded ${turbines.length.toLocaleString()} wind turbines`);
     
+    if (turbines.length === 0) {
+      onProgress?.(`No wind turbines found in ${region.name} data. Using synthetic data...`);
+      console.warn('Parsed 0 turbines. First 500 chars of CSV:', csvText.substring(0, 500));
+      return synthesizeTurbineData(region);
+    }
+    
+    onProgress?.(`Loaded ${turbines.length.toLocaleString()} wind turbines`);
     return turbines;
   } catch (error) {
     console.error('Failed to fetch real data:', error);
