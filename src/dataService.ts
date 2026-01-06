@@ -42,7 +42,19 @@ function parseOPSDData(csvText: string, filterWind: boolean = true): Turbine[] {
     skipEmptyLines: true,
   });
 
+  console.log(`Papa parsed ${result.data.length} rows, errors:`, result.errors.length);
+  if (result.errors.length > 0) {
+    console.warn('Parse errors:', result.errors.slice(0, 5));
+  }
+  if (result.data.length > 0) {
+    console.log('Sample row:', result.data[0]);
+    console.log('Column names:', Object.keys(result.data[0]));
+  }
+
   const turbines: Turbine[] = [];
+  let skippedNotWind = 0;
+  let skippedNoCoords = 0;
+  let skippedSmall = 0;
   
   for (const row of result.data) {
     // Filter for wind turbines only
@@ -51,7 +63,10 @@ function parseOPSDData(csvText: string, filterWind: boolean = true): Turbine[] {
                      row.technology?.toLowerCase().includes('wind') ||
                      row.technology?.toLowerCase().includes('onshore') ||
                      row.technology?.toLowerCase().includes('offshore');
-      if (!isWind) continue;
+      if (!isWind) {
+        skippedNotWind++;
+        continue;
+      }
     }
 
     const lon = parseFloat(row.lon || '');
@@ -59,10 +74,16 @@ function parseOPSDData(csvText: string, filterWind: boolean = true): Turbine[] {
     const capacity = parseFloat(row.electrical_capacity || '0');
 
     // Skip records without valid coordinates
-    if (isNaN(lon) || isNaN(lat) || lon === 0 || lat === 0) continue;
+    if (isNaN(lon) || isNaN(lat) || lon === 0 || lat === 0) {
+      skippedNoCoords++;
+      continue;
+    }
     
     // Skip very small installations (< 0.1 MW)
-    if (capacity < 0.1) continue;
+    if (capacity < 0.1) {
+      skippedSmall++;
+      continue;
+    }
 
     const year = row.commissioning_date ? 
       parseInt(row.commissioning_date.substring(0, 4)) : undefined;
@@ -81,6 +102,7 @@ function parseOPSDData(csvText: string, filterWind: boolean = true): Turbine[] {
     });
   }
 
+  console.log(`Parse stats: ${turbines.length} wind turbines, skipped: ${skippedNotWind} not wind, ${skippedNoCoords} no coords, ${skippedSmall} too small`);
   return turbines;
 }
 
@@ -264,33 +286,47 @@ export async function fetchRealTurbineData(
 
   try {
     onProgress?.(`Fetching real wind turbine data for ${region.name}...`);
+    console.log(`Fetching data for ${region.id} from:`, url);
     
     // Try multiple CORS proxies in case one fails
+    // Note: Large files like France (13MB) may timeout on some proxies
     const corsProxies = [
       (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
       (u: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+      (u: string) => `https://cors-anywhere.herokuapp.com/${u}`,
     ];
 
     let csvText = '';
     let lastError: Error | null = null;
+    let proxyIndex = 0;
 
     for (const proxyFn of corsProxies) {
+      proxyIndex++;
       try {
         const proxyUrl = proxyFn(url);
-        onProgress?.(`Trying to fetch data...`);
+        onProgress?.(`Trying proxy ${proxyIndex}/${corsProxies.length}...`);
+        console.log(`Trying proxy ${proxyIndex}:`, proxyUrl.substring(0, 80) + '...');
         
-        const response = await fetch(proxyUrl);
+        // Use AbortController for timeout (60 seconds for large files)
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 60000);
+        
+        const response = await fetch(proxyUrl, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
 
         csvText = await response.text();
+        console.log(`Received ${csvText.length} bytes from proxy ${proxyIndex}`);
+        
         if (csvText && csvText.length > 100) {
           break; // Success!
         }
       } catch (e) {
         lastError = e as Error;
-        console.warn('CORS proxy failed:', e);
+        console.warn(`CORS proxy ${proxyIndex} failed:`, e);
       }
     }
 
@@ -299,11 +335,18 @@ export async function fetchRealTurbineData(
     }
 
     onProgress?.('Parsing CSV data...');
+    console.log('CSV first 200 chars:', csvText.substring(0, 200));
+    
     const turbines = parseOPSDData(csvText);
+    console.log(`Parsed ${turbines.length} wind turbines from CSV`);
     
     if (turbines.length === 0) {
       onProgress?.(`No wind turbines found in ${region.name} data. Using synthetic data...`);
       console.warn('Parsed 0 turbines. First 500 chars of CSV:', csvText.substring(0, 500));
+      // Check if we got HTML error page instead of CSV
+      if (csvText.includes('<html') || csvText.includes('<!DOCTYPE')) {
+        console.error('Received HTML instead of CSV - proxy returned error page');
+      }
       return synthesizeTurbineData(region);
     }
     
