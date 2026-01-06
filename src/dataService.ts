@@ -289,11 +289,10 @@ export async function fetchRealTurbineData(
     console.log(`Fetching data for ${region.id} from:`, url);
     
     // Try multiple CORS proxies in case one fails
-    // Note: Large files like France (13MB) may timeout on some proxies
+    // allorigins is most reliable, corsproxy.io as backup
     const corsProxies = [
-      (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
       (u: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-      (u: string) => `https://cors-anywhere.herokuapp.com/${u}`,
+      (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
     ];
 
     let csvText = '';
@@ -304,12 +303,12 @@ export async function fetchRealTurbineData(
       proxyIndex++;
       try {
         const proxyUrl = proxyFn(url);
-        onProgress?.(`Trying proxy ${proxyIndex}/${corsProxies.length}...`);
+        onProgress?.(`Fetching data...`);
         console.log(`Trying proxy ${proxyIndex}:`, proxyUrl.substring(0, 80) + '...');
         
-        // Use AbortController for timeout (60 seconds for large files)
+        // Use AbortController for timeout (30 seconds - shorter for faster failover)
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 60000);
+        const timeoutId = setTimeout(() => controller.abort(), 30000);
         
         const response = await fetch(proxyUrl, { signal: controller.signal });
         clearTimeout(timeoutId);
@@ -322,11 +321,13 @@ export async function fetchRealTurbineData(
         console.log(`Received ${csvText.length} bytes from proxy ${proxyIndex}`);
         
         if (csvText && csvText.length > 100) {
+          onProgress?.(`Downloaded ${(csvText.length / 1024 / 1024).toFixed(1)} MB`);
           break; // Success!
         }
       } catch (e) {
         lastError = e as Error;
         console.warn(`CORS proxy ${proxyIndex} failed:`, e);
+        onProgress?.(`Proxy ${proxyIndex} failed, trying next...`);
       }
     }
 
