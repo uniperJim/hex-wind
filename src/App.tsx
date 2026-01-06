@@ -383,8 +383,10 @@ function App() {
             <option key={r.id} value={r.id}>{r.name}</option>
           ))}
         </select>
-        <label className="data-toggle">
+        <label htmlFor="use-real-data" className="data-toggle">
           <input
+            id="use-real-data"
+            name="use-real-data"
             type="checkbox"
             checked={useRealData}
             onChange={handleDataSourceChange}

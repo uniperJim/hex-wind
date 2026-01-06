@@ -49,6 +49,19 @@ function parseOPSDData(csvText: string, filterWind: boolean = true): Turbine[] {
   if (result.data.length > 0) {
     console.log('Sample row:', result.data[0]);
     console.log('Column names:', Object.keys(result.data[0]));
+    
+    // Log unique energy source values to debug filtering
+    const energySources = new Set<string>();
+    const technologies = new Set<string>();
+    let withCoords = 0;
+    for (const row of result.data.slice(0, 1000)) {
+      if (row.energy_source_level_2) energySources.add(row.energy_source_level_2);
+      if (row.technology) technologies.add(row.technology);
+      if (row.lon && row.lat && row.lon !== '0' && row.lat !== '0') withCoords++;
+    }
+    console.log('Energy sources (first 1000):', Array.from(energySources));
+    console.log('Technologies (first 1000):', Array.from(technologies));
+    console.log('Rows with coords (first 1000):', withCoords);
   }
 
   const turbines: Turbine[] = [];
