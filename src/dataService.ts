@@ -4,6 +4,7 @@ import { Turbine, RegionConfig } from './types';
 // Real data sources from Open Power System Data (OPSD)
 // https://data.open-power-system-data.org/renewable_power_plants/
 const OPSD_DATA_URLS: Record<string, string> = {
+  // Note: Norway uses NVE ArcGIS REST API instead of OPSD
   germany: 'https://data.open-power-system-data.org/renewable_power_plants/2020-08-25/renewable_power_plants_DE.csv',
   uk: 'https://data.open-power-system-data.org/renewable_power_plants/2020-08-25/renewable_power_plants_UK.csv',
   eu: 'https://data.open-power-system-data.org/renewable_power_plants/2020-08-25/renewable_power_plants_EU.csv',
@@ -83,11 +84,177 @@ function parseOPSDData(csvText: string, filterWind: boolean = true): Turbine[] {
   return turbines;
 }
 
-// Fetch real data from OPSD
+// NVE ArcGIS REST API for Norway wind power data
+// https://nve.geodataonline.no/arcgis/rest/services/Vindkraft2/MapServer
+const NVE_WIND_API = 'https://nve.geodataonline.no/arcgis/rest/services/Vindkraft2/MapServer/0/query';
+
+interface NVEFeature {
+  attributes: {
+    OBJECTID: number;
+    anleggNavn: string;
+    fylkeNavn: string;
+    kommune: string;
+    effekt_MW_idrift: number;
+    effekt_MW: number;
+    antallTurbiner: number;
+    forsteIdriftDato: number | null;
+    status: string;
+  };
+  geometry: {
+    x: number;
+    y: number;
+  };
+}
+
+// Convert UTM zone 33N (EPSG:25833) to WGS84 (EPSG:4326)
+// Simplified conversion using Proj4 formulas
+function utm33nToWgs84(x: number, y: number): { lon: number; lat: number } {
+  // UTM zone 33N parameters
+  const k0 = 0.9996; // Scale factor
+  const e = 0.0818191908426; // Eccentricity of WGS84 ellipsoid
+  const a = 6378137.0; // Semi-major axis
+  const e1sq = 0.006739497;
+  const centralMeridian = 15; // Zone 33 central meridian in degrees
+
+  // Remove false easting and convert to meters from central meridian
+  const x1 = x - 500000;
+  const y1 = y;
+
+  // Calculate footprint latitude
+  const M = y1 / k0;
+  const mu = M / (a * (1 - e * e / 4 - 3 * Math.pow(e, 4) / 64 - 5 * Math.pow(e, 6) / 256));
+  
+  const e1 = (1 - Math.sqrt(1 - e * e)) / (1 + Math.sqrt(1 - e * e));
+  const phi1 = mu + 
+    (3 * e1 / 2 - 27 * Math.pow(e1, 3) / 32) * Math.sin(2 * mu) +
+    (21 * e1 * e1 / 16 - 55 * Math.pow(e1, 4) / 32) * Math.sin(4 * mu) +
+    (151 * Math.pow(e1, 3) / 96) * Math.sin(6 * mu) +
+    (1097 * Math.pow(e1, 4) / 512) * Math.sin(8 * mu);
+
+  const sinPhi1 = Math.sin(phi1);
+  const cosPhi1 = Math.cos(phi1);
+  const tanPhi1 = Math.tan(phi1);
+
+  const N1 = a / Math.sqrt(1 - e * e * sinPhi1 * sinPhi1);
+  const T1 = tanPhi1 * tanPhi1;
+  const C1 = e1sq * cosPhi1 * cosPhi1;
+  const R1 = a * (1 - e * e) / Math.pow(1 - e * e * sinPhi1 * sinPhi1, 1.5);
+  const D = x1 / (N1 * k0);
+
+  const lat = phi1 - (N1 * tanPhi1 / R1) * (
+    D * D / 2 -
+    (5 + 3 * T1 + 10 * C1 - 4 * C1 * C1 - 9 * e1sq) * Math.pow(D, 4) / 24 +
+    (61 + 90 * T1 + 298 * C1 + 45 * T1 * T1 - 252 * e1sq - 3 * C1 * C1) * Math.pow(D, 6) / 720
+  );
+
+  const lon = centralMeridian + (
+    D -
+    (1 + 2 * T1 + C1) * Math.pow(D, 3) / 6 +
+    (5 - 2 * C1 + 28 * T1 - 3 * C1 * C1 + 8 * e1sq + 24 * T1 * T1) * Math.pow(D, 5) / 120
+  ) / cosPhi1 * (180 / Math.PI);
+
+  return {
+    lon,
+    lat: lat * (180 / Math.PI)
+  };
+}
+
+// Fetch Norway wind power data from NVE
+async function fetchNorwayData(onProgress?: (message: string) => void): Promise<Turbine[]> {
+  onProgress?.('Fetching Norway wind power data from NVE...');
+  
+  const queryParams = new URLSearchParams({
+    where: "status = 'D'", // D = Drift (operational)
+    outFields: 'OBJECTID,anleggNavn,fylkeNavn,kommune,effekt_MW_idrift,effekt_MW,antallTurbiner,forsteIdriftDato,status',
+    returnGeometry: 'true',
+    f: 'json',
+    outSR: '25833', // Keep in UTM zone 33N, we'll convert
+  });
+
+  try {
+    const response = await fetch(`${NVE_WIND_API}?${queryParams}`);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    
+    if (!data.features || data.features.length === 0) {
+      onProgress?.('No features found in NVE data');
+      return [];
+    }
+
+    onProgress?.(`Parsing ${data.features.length} wind farms from NVE...`);
+
+    const turbines: Turbine[] = [];
+    
+    for (const feature of data.features as NVEFeature[]) {
+      const attrs = feature.attributes;
+      const geom = feature.geometry;
+
+      if (!geom || geom.x === 0 || geom.y === 0) continue;
+
+      const capacity = attrs.effekt_MW_idrift || attrs.effekt_MW || 0;
+      if (capacity < 0.1) continue;
+
+      // Convert UTM to WGS84
+      const { lon, lat } = utm33nToWgs84(geom.x, geom.y);
+
+      // Skip if coordinates are clearly out of Norway bounds
+      if (lon < 4 || lon > 32 || lat < 57 || lat > 72) {
+        console.warn('Skipping out-of-bounds point:', { lon, lat, name: attrs.anleggNavn });
+        continue;
+      }
+
+      const year = attrs.forsteIdriftDato ? 
+        new Date(attrs.forsteIdriftDato).getFullYear() : undefined;
+
+      // For wind farms with multiple turbines, create individual turbine points
+      const numTurbines = attrs.antallTurbiner || 1;
+      const capacityPerTurbine = capacity / numTurbines;
+
+      // Add slight randomization for farms with multiple turbines
+      for (let i = 0; i < numTurbines; i++) {
+        const offsetLon = numTurbines > 1 ? (Math.random() - 0.5) * 0.02 : 0;
+        const offsetLat = numTurbines > 1 ? (Math.random() - 0.5) * 0.015 : 0;
+
+        turbines.push({
+          lon: lon + offsetLon,
+          lat: lat + offsetLat,
+          capacity_mw: Math.round(capacityPerTurbine * 100) / 100,
+          manufacturer: 'Unknown', // NVE doesn't provide manufacturer data
+          model: 'Unknown',
+          project: attrs.anleggNavn || 'Wind Farm',
+          year: year && !isNaN(year) ? year : undefined,
+          state: attrs.fylkeNavn || attrs.kommune || 'Norway',
+        });
+      }
+    }
+
+    onProgress?.(`Loaded ${turbines.length.toLocaleString()} wind turbines from NVE`);
+    return turbines;
+  } catch (error) {
+    console.error('Failed to fetch NVE data:', error);
+    throw error;
+  }
+}
+
+// Fetch real data from OPSD or NVE (Norway)
 export async function fetchRealTurbineData(
   region: RegionConfig,
   onProgress?: (message: string) => void
 ): Promise<Turbine[]> {
+  // Norway uses NVE ArcGIS REST API directly (no CORS issues)
+  if (region.id === 'norway') {
+    try {
+      return await fetchNorwayData(onProgress);
+    } catch (error) {
+      console.error('Failed to fetch Norway data:', error);
+      onProgress?.(`Failed to fetch Norway data: ${error}. Using synthetic data...`);
+      return synthesizeTurbineData(region);
+    }
+  }
+
   const url = OPSD_DATA_URLS[region.id];
   
   if (!url) {
@@ -170,6 +337,13 @@ const WIND_FARM_CLUSTERS: Record<string, Array<{ center: [number, number]; radiu
     { center: [-100.0, 44.5], radius: 0.6, count: 800, name: 'South Dakota' },
     { center: [-94.0, 45.0], radius: 0.7, count: 1500, name: 'Minnesota' },
   ],
+  norway: [
+    { center: [9.0, 59.0], radius: 0.6, count: 400, name: 'Rogaland' },
+    { center: [6.5, 62.0], radius: 0.5, count: 350, name: 'Møre og Romsdal' },
+    { center: [10.5, 63.5], radius: 0.7, count: 500, name: 'Trøndelag' },
+    { center: [12.0, 66.0], radius: 0.5, count: 300, name: 'Nordland' },
+    { center: [18.5, 69.5], radius: 0.6, count: 250, name: 'Troms og Finnmark' },
+  ],
   germany: [
     { center: [9.0, 54.5], radius: 0.8, count: 2500, name: 'Schleswig-Holstein' },
     { center: [9.5, 53.5], radius: 0.5, count: 1200, name: 'Hamburg Region' },
@@ -229,6 +403,10 @@ const WIND_FARM_CLUSTERS: Record<string, Array<{ center: [number, number]; radiu
     { center: [-8.0, 40.0], radius: 0.5, count: 900, name: 'Portugal' },
     // Austria
     { center: [16.0, 48.0], radius: 0.4, count: 500, name: 'Austria East' },
+    // Norway
+    { center: [9.0, 59.0], radius: 0.6, count: 400, name: 'Southwest Norway' },
+    { center: [10.5, 63.5], radius: 0.8, count: 600, name: 'Central Norway' },
+    { center: [15.0, 68.0], radius: 0.5, count: 300, name: 'Northern Norway' },
     // Ireland
     { center: [-8.5, 53.5], radius: 0.6, count: 800, name: 'Ireland' },
     // Greece

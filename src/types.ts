@@ -63,6 +63,13 @@ export const REGIONS: RegionConfig[] = [
     hasRealData: true,
   },
   {
+    id: 'norway',
+    name: 'Norway',
+    center: [10.0, 63.0],
+    zoom: 4,
+    hasRealData: true,
+  },
+  {
     id: 'eu',
     name: 'European Union',
     center: [10.0, 50.0],
